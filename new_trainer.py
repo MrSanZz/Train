@@ -20,15 +20,38 @@ from nltk.corpus import stopwords
 nltk.download('punkt')
 nltk.download('stopwords')
 
-# Fungsi untuk mencari file dengan ekstensi yang diinginkan secara rekursif dengan progres menggunakan \r
+# Fungsi untuk auto-detect kolom untuk tag, patterns, responses
+def auto_detect_columns(df):
+    col_tag = None
+    col_patterns = None
+    col_responses = None
+
+    # Cari berdasarkan nama kolom (case-insensitive)
+    for col in df.columns:
+        col_lower = col.lower()
+        if "tag" in col_lower and col_tag is None:
+            col_tag = col
+        elif "pattern" in col_lower and col_patterns is None:
+            col_patterns = col
+        elif "response" in col_lower and col_responses is None:
+            col_responses = col
+
+    # Jika belum terdeteksi dan jumlah kolom tepat 3, gunakan urutan kolom
+    if (col_tag is None or col_patterns is None or col_responses is None) and len(df.columns) == 3:
+        cols = df.columns.tolist()
+        col_tag, col_patterns, col_responses = cols[0], cols[1], cols[2]
+
+    if col_tag is None or col_patterns is None or col_responses is None:
+        raise ValueError("Tidak dapat mendeteksi kolom yang diperlukan secara otomatis.")
+    return col_tag, col_patterns, col_responses
+
+# Fungsi untuk mencari file dengan ekstensi yang diinginkan secara rekursif dengan progress menggunakan \r
 def find_data_files(directory):
     valid_exts = ('.json', '.csv', '.parquet', '.xml', '.txt', '.log', '.sql', '.db', '.npy')
-    
-    # Hitung total file untuk keperluan progress
     total_files = sum(len(files) for _, _, files in os.walk(directory))
     scanned_files = 0
     data_files = []
-    
+
     for root, dirs, files in os.walk(directory):
         for file in files:
             scanned_files += 1
@@ -36,7 +59,6 @@ def find_data_files(directory):
             file_path = os.path.join(root, file)
             if file.lower().endswith(valid_exts):
                 data_files.append(file_path)
-                # Update progress dengan carriage return
                 sys.stdout.write(f"\r{progress}% Dir: {file_path}")
                 sys.stdout.flush()
     print()  # pindah ke baris baru setelah selesai
@@ -49,15 +71,16 @@ def load_data(file_path):
             data = json.load(file)
     elif file_path.lower().endswith('.csv'):
         df = pd.read_csv(file_path)
-        # Cek apakah CSV memiliki kolom yang dibutuhkan
-        required_cols = ['tag', 'patterns', 'responses']
-        if not all(col in df.columns for col in required_cols):
-            raise ValueError(f"CSV file {file_path} tidak memiliki kolom yang dibutuhkan: {required_cols}")
+        try:
+            col_tag, col_patterns, col_responses = auto_detect_columns(df)
+        except Exception as e:
+            raise ValueError(f"CSV file {file_path} tidak dapat dideteksi kolomnya: {e}")
         data = {"intents": []}
         for _, row in df.iterrows():
-            tag = row['tag']
+            tag = row[col_tag]
+            patterns = row[col_patterns]
+            responses = row[col_responses]
             # Proses kolom patterns
-            patterns = row['patterns']
             if isinstance(patterns, str):
                 if patterns.strip().startswith('['):
                     try:
@@ -67,7 +90,6 @@ def load_data(file_path):
                 else:
                     patterns = patterns.split(';')
             # Proses kolom responses
-            responses = row['responses']
             if isinstance(responses, str):
                 if responses.strip().startswith('['):
                     try:
@@ -83,10 +105,15 @@ def load_data(file_path):
             })
     elif file_path.lower().endswith('.parquet'):
         df = pd.read_parquet(file_path)
+        try:
+            col_tag, col_patterns, col_responses = auto_detect_columns(df)
+        except Exception as e:
+            raise ValueError(f"Parquet file {file_path} tidak dapat mendeteksi kolomnya: {e}")
         data = {"intents": []}
         for _, row in df.iterrows():
-            tag = row['tag']
-            patterns = row['patterns']
+            tag = row[col_tag]
+            patterns = row[col_patterns]
+            responses = row[col_responses]
             if isinstance(patterns, str):
                 if patterns.strip().startswith('['):
                     try:
@@ -95,7 +122,6 @@ def load_data(file_path):
                         patterns = patterns.split(';')
                 else:
                     patterns = patterns.split(';')
-            responses = row['responses']
             if isinstance(responses, str):
                 if responses.strip().startswith('['):
                     try:
@@ -133,16 +159,13 @@ def load_data(file_path):
                 'responses': responses
             })
     elif file_path.lower().endswith(('.txt', '.log')):
-        # Diasumsikan file TXT/LOG berisi data dalam format JSON
         with open(file_path, 'r', encoding='utf-8') as file:
             content = file.read()
             data = json.loads(content)
     elif file_path.lower().endswith('.sql'):
-        # Parsing sederhana file SQL yang mengandung INSERT INTO intents(...)
         data = {"intents": []}
         with open(file_path, 'r', encoding='utf-8') as file:
             content = file.read()
-        # Regex untuk mencari pernyataan INSERT
         pattern = r"INSERT INTO\s+intents\s*\(.*?\)\s*VALUES\s*\((.*?)\);"
         matches = re.findall(pattern, content, re.IGNORECASE | re.DOTALL)
         for match in matches:
@@ -165,15 +188,17 @@ def load_data(file_path):
                     'responses': responses
                 })
     elif file_path.lower().endswith('.db'):
-        # Membaca file SQLite, diasumsikan ada tabel 'intents' dengan kolom: tag, patterns, responses
         data = {"intents": []}
         conn = sqlite3.connect(file_path)
         cur = conn.cursor()
         try:
-            cur.execute("SELECT tag, patterns, responses FROM intents")
+            cur.execute("SELECT * FROM intents")
             rows = cur.fetchall()
+            # Asumsikan urutan kolom: tag, patterns, responses (tanpa mempedulikan nama kolom)
             for row in rows:
-                tag, patterns_val, responses_val = row
+                if len(row) < 3:
+                    continue
+                tag, patterns_val, responses_val = row[:3]
                 try:
                     patterns = json.loads(patterns_val)
                 except Exception:
@@ -204,7 +229,7 @@ def load_data(file_path):
         raise ValueError("Format file tidak didukung: " + file_path)
     return data
 
-# Fungsi untuk memuat dan menggabungkan data dari semua file yang ditemukan
+# Fungsi untuk menggabungkan data dari seluruh file yang ditemukan
 def load_all_data(directory):
     data_files = find_data_files(directory)
     if not data_files:
@@ -222,7 +247,7 @@ def load_all_data(directory):
             print(f"Gagal memuat file: {file} Error: {e}")
     return combined_data
 
-# Fungsi untuk preprocessing data: tokenisasi dan pengumpulan kata
+# Fungsi preprocessing: tokenisasi dan pengumpulan kata
 def preprocess_data(data):
     words, labels, docs_x, docs_y = [], [], [], []
     for intent in data['intents']:
@@ -268,7 +293,7 @@ def train_model(model, X_train, y_train):
     model.fit(X_train, y_train, epochs=200, batch_size=8, verbose=1)
     model.save("chatbot_model.h5")
 
-# Memprediksi kelas (tag) untuk input pengguna
+# Prediksi kelas (tag) untuk input pengguna
 def predict_class(sentence, words, labels, model):
     tokens = word_tokenize(sentence)
     bag = np.array([1 if w in tokens else 0 for w in words]).reshape(1, -1, 1)
@@ -291,16 +316,18 @@ def chatbot(data, words, labels):
             print("Bot: Maaf, saya tidak mengerti.")
 
 if __name__ == "__main__":
-    # Ubah data_directory sesuai kebutuhan; misalnya root directory '/'
+    # Ubah data_directory sesuai kebutuhan; misalnya "./datasets"
     data_directory = "./datasets"  
     data = load_all_data(data_directory)
     words, labels, docs_x, docs_y = preprocess_data(data)
     X_train, y_train = prepare_training_data(words, labels, docs_x, docs_y)
-    X_train = X_train.reshape(X_train.shape[0], X_train.shape[1], 1)
     
-    # Membuat dan melatih model
+    # Pastikan X_train memiliki dimensi yang sesuai sebelum reshape
+    if len(X_train.shape) == 2:
+        X_train = X_train.reshape(X_train.shape[0], X_train.shape[1], 1)
+    else:
+        raise ValueError("X_train tidak memiliki dimensi yang sesuai.")
+    
     model = create_model(X_train.shape, len(labels))
     train_model(model, X_train, y_train)
-    
-    # Mulai interaksi dengan chatbot
     chatbot(data, words, labels)
