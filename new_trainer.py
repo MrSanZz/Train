@@ -1,6 +1,9 @@
 import os
+import sys
 import json
 import ast
+import re
+import sqlite3
 import numpy as np
 import pandas as pd
 import random
@@ -17,13 +20,12 @@ from nltk.corpus import stopwords
 nltk.download('punkt')
 nltk.download('stopwords')
 
-# Fungsi untuk mencari file dengan ekstensi .json, .csv, .parquet, atau .xml secara rekursif dengan menampilkan progres
+# Fungsi untuk mencari file dengan ekstensi yang diinginkan secara rekursif dengan progres menggunakan \r
 def find_data_files(directory):
-    # Hitung total file di direktori dan subdirektori
-    total_files = 0
-    for _, _, files in os.walk(directory):
-        total_files += len(files)
-        
+    valid_exts = ('.json', '.csv', '.parquet', '.xml', '.txt', '.log', '.sql', '.db', '.npy')
+    
+    # Hitung total file untuk keperluan progress
+    total_files = sum(len(files) for _, _, files in os.walk(directory))
     scanned_files = 0
     data_files = []
     
@@ -31,20 +33,26 @@ def find_data_files(directory):
         for file in files:
             scanned_files += 1
             progress = int((scanned_files / total_files) * 100)
-            if file.lower().endswith(('.json', '.csv', '.parquet', '.xml')):
-                file_path = os.path.join(root, file)
+            file_path = os.path.join(root, file)
+            if file.lower().endswith(valid_exts):
                 data_files.append(file_path)
-                print(f"{progress}%")
-                print("Dir:", file_path)
+                # Update progress dengan carriage return
+                sys.stdout.write(f"\r{progress}% Dir: {file_path}")
+                sys.stdout.flush()
+    print()  # pindah ke baris baru setelah selesai
     return data_files
 
-# Fungsi untuk memuat data dari file JSON, CSV, Parquet, atau XML
+# Fungsi untuk memuat data dari berbagai format file
 def load_data(file_path):
     if file_path.lower().endswith('.json'):
         with open(file_path, 'r', encoding='utf-8') as file:
             data = json.load(file)
     elif file_path.lower().endswith('.csv'):
         df = pd.read_csv(file_path)
+        # Cek apakah CSV memiliki kolom yang dibutuhkan
+        required_cols = ['tag', 'patterns', 'responses']
+        if not all(col in df.columns for col in required_cols):
+            raise ValueError(f"CSV file {file_path} tidak memiliki kolom yang dibutuhkan: {required_cols}")
         data = {"intents": []}
         for _, row in df.iterrows():
             tag = row['tag']
@@ -78,7 +86,6 @@ def load_data(file_path):
         data = {"intents": []}
         for _, row in df.iterrows():
             tag = row['tag']
-            # Proses kolom patterns
             patterns = row['patterns']
             if isinstance(patterns, str):
                 if patterns.strip().startswith('['):
@@ -88,7 +95,6 @@ def load_data(file_path):
                         patterns = patterns.split(';')
                 else:
                     patterns = patterns.split(';')
-            # Proses kolom responses
             responses = row['responses']
             if isinstance(responses, str):
                 if responses.strip().startswith('['):
@@ -109,14 +115,12 @@ def load_data(file_path):
         data = {"intents": []}
         for intent in root.findall('intent'):
             tag = intent.find('tag').text if intent.find('tag') is not None else ''
-            # Proses kolom patterns
             patterns = []
             patterns_node = intent.find('patterns')
             if patterns_node is not None:
                 for p in patterns_node.findall('pattern'):
                     if p.text:
                         patterns.append(p.text)
-            # Proses kolom responses
             responses = []
             responses_node = intent.find('responses')
             if responses_node is not None:
@@ -128,6 +132,74 @@ def load_data(file_path):
                 'patterns': patterns,
                 'responses': responses
             })
+    elif file_path.lower().endswith(('.txt', '.log')):
+        # Diasumsikan file TXT/LOG berisi data dalam format JSON
+        with open(file_path, 'r', encoding='utf-8') as file:
+            content = file.read()
+            data = json.loads(content)
+    elif file_path.lower().endswith('.sql'):
+        # Parsing sederhana file SQL yang mengandung INSERT INTO intents(...)
+        data = {"intents": []}
+        with open(file_path, 'r', encoding='utf-8') as file:
+            content = file.read()
+        # Regex untuk mencari pernyataan INSERT
+        pattern = r"INSERT INTO\s+intents\s*\(.*?\)\s*VALUES\s*\((.*?)\);"
+        matches = re.findall(pattern, content, re.IGNORECASE | re.DOTALL)
+        for match in matches:
+            values = re.findall(r"'(.*?)'", match)
+            if len(values) >= 3:
+                tag = values[0]
+                patterns_str = values[1]
+                responses_str = values[2]
+                try:
+                    patterns = json.loads(patterns_str)
+                except Exception:
+                    patterns = patterns_str.split(';')
+                try:
+                    responses = json.loads(responses_str)
+                except Exception:
+                    responses = responses_str.split(';')
+                data['intents'].append({
+                    'tag': tag,
+                    'patterns': patterns,
+                    'responses': responses
+                })
+    elif file_path.lower().endswith('.db'):
+        # Membaca file SQLite, diasumsikan ada tabel 'intents' dengan kolom: tag, patterns, responses
+        data = {"intents": []}
+        conn = sqlite3.connect(file_path)
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT tag, patterns, responses FROM intents")
+            rows = cur.fetchall()
+            for row in rows:
+                tag, patterns_val, responses_val = row
+                try:
+                    patterns = json.loads(patterns_val)
+                except Exception:
+                    patterns = patterns_val.split(';')
+                try:
+                    responses = json.loads(responses_val)
+                except Exception:
+                    responses = responses_val.split(';')
+                data['intents'].append({
+                    'tag': tag,
+                    'patterns': patterns,
+                    'responses': responses
+                })
+        except Exception as e:
+            raise ValueError(f"Error reading .db file {file_path}: {e}")
+        finally:
+            conn.close()
+    elif file_path.lower().endswith('.npy'):
+        loaded = np.load(file_path, allow_pickle=True)
+        if isinstance(loaded, dict) and "intents" in loaded:
+            data = loaded
+        else:
+            data = {"intents": []}
+            for item in loaded:
+                if isinstance(item, dict) and 'tag' in item and 'patterns' in item and 'responses' in item:
+                    data['intents'].append(item)
     else:
         raise ValueError("Format file tidak didukung: " + file_path)
     return data
@@ -136,15 +208,18 @@ def load_data(file_path):
 def load_all_data(directory):
     data_files = find_data_files(directory)
     if not data_files:
-        raise ValueError("Tidak ada file JSON, CSV, Parquet, atau XML yang ditemukan di directory: " + directory)
+        raise ValueError("Tidak ada file dengan ekstensi yang didukung ditemukan di directory: " + directory)
     combined_data = {"intents": []}
     for file in data_files:
-        print("Loading file:", file)
-        dataset = load_data(file)
-        if "intents" in dataset:
-            combined_data["intents"].extend(dataset["intents"])
-        else:
-            print("File", file, "tidak memiliki key 'intents'")
+        print(f"\nLoading file: {file}")
+        try:
+            dataset = load_data(file)
+            if "intents" in dataset:
+                combined_data["intents"].extend(dataset["intents"])
+            else:
+                print("File", file, "tidak memiliki key 'intents'")
+        except Exception as e:
+            print(f"Gagal memuat file: {file} Error: {e}")
     return combined_data
 
 # Fungsi untuk preprocessing data: tokenisasi dan pengumpulan kata
@@ -209,12 +284,15 @@ def chatbot(data, words, labels):
         if user_input.lower() == 'exit':
             break
         tag = predict_class(user_input, words, labels, model)
-        responses = [i['responses'] for i in data['intents'] if i['tag'] == tag][0]
-        print("Bot:", random.choice(responses))
+        responses = [i['responses'] for i in data['intents'] if i['tag'] == tag]
+        if responses:
+            print("Bot:", random.choice(responses[0]))
+        else:
+            print("Bot: Maaf, saya tidak mengerti.")
 
 if __name__ == "__main__":
-    # Ubah data_directory sesuai kebutuhan; contoh di sini adalah direktori root '/'
-    data_directory = "/"  
+    # Ubah data_directory sesuai kebutuhan; misalnya root directory '/'
+    data_directory = "./datasets"  
     data = load_all_data(data_directory)
     words, labels, docs_x, docs_y = preprocess_data(data)
     X_train, y_train = prepare_training_data(words, labels, docs_x, docs_y)
